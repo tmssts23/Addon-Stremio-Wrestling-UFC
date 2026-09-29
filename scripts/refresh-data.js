@@ -4,6 +4,7 @@
 //   npm run refresh-data                 -> promocoes + eventos UFC
 //   node scripts/refresh-data.js --shows -> so as promocoes
 //   node scripts/refresh-data.js --ufc   -> so os eventos UFC
+//   node scripts/refresh-data.js --docs  -> so os documentarios WWE (Cinemeta, sem chave)
 //
 // Precisa de TMDB_API_KEY (ou TMDB_ACCESS_TOKEN). Os dados ficam no repositorio
 // para que os catalogos respondam de imediato em arranques a frio; em execucao o
@@ -14,12 +15,14 @@ const path = require('path');
 const tmdb = require('../lib/tmdb');
 const store = require('../lib/store');
 const imdbids = require('../lib/imdbids');
+const documentaries = require('../lib/documentaries');
 const { PROMOTIONS, WRESTLING_KEYS } = require('../lib/promotions');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const args = process.argv.slice(2);
 const onlyShows = args.includes('--shows');
 const onlyUfc = args.includes('--ufc');
+const onlyDocs = args.includes('--docs');
 const client = tmdb.client();
 
 function write(name, value) {
@@ -97,7 +100,23 @@ async function refreshUfc() {
   write('ufc-events.json', list);
 }
 
+async function refreshDocs() {
+  console.log('A actualizar documentários WWE (Cinemeta)...');
+  const list = await documentaries.resolveAll({ skipBaked: false });
+  const faltam = documentaries.DOCUMENTARIES.filter(
+    (doc) => !list.some((item) => item.key === documentaries.keyOf(doc))
+  );
+  if (!list.length) {
+    console.log('  sem resposta, mantém o que estava guardado');
+    return;
+  }
+  console.log(`  ${list.length} de ${documentaries.DOCUMENTARIES.length} encontrados | ${resumo(list)}`);
+  if (faltam.length) console.log(`  não encontrados: ${faltam.map((d) => d.title).join('; ')}`);
+  write('wwe-docs.json', list);
+}
+
 (async () => {
+  if (onlyDocs) return refreshDocs();
   if (!client.enabled) {
     console.error(
       'Falta TMDB_API_KEY.\n' +
@@ -110,6 +129,7 @@ async function refreshUfc() {
   const started = Date.now();
   if (!onlyUfc) await refreshShows();
   if (!onlyShows) await refreshUfc();
+  if (!onlyShows && !onlyUfc) await refreshDocs();
   // Data da recolha: o addon usa-a para nao repetir a recolha em execucao antes de 24 h.
   write('meta.json', { generatedAt: new Date().toISOString() });
   console.log(`Concluído em ${((Date.now() - started) / 1000).toFixed(1)}s`);

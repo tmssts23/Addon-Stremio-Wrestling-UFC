@@ -17668,11 +17668,14 @@ var require_store = __commonJS({
       const data = await promotionData(promoKey, client);
       return buildFranchises(promoKey, data.movies).find((g) => g.slug === slug) || null;
     }
-    async function tmdbEpisodes(tvId, tmdbApi, { maxSeasons = 60 } = {}) {
+    async function tmdbEpisodes(tvId, tmdbApi, { maxSeasons = 60, year = null } = {}) {
       if (!tmdbApi) return [];
       const show = await tmdbApi.tv(tvId);
       if (!show) return [];
-      const seasons = show.seasons.slice(-maxSeasons);
+      const seasons = year ? show.seasons.filter((s) => {
+        const start = Number(String(s.premiered || "").slice(0, 4));
+        return !start || start === year || start === year - 1;
+      }) : show.seasons.slice(-maxSeasons);
       const lists = await mapLimit(seasons, tmdb2.CONCURRENCY, tmdb2.SPACING_MS, (s) => tmdbApi.season(tvId, s.number));
       const out = [];
       for (const list of lists) for (const ep of list || []) out.push(ep);
@@ -17809,6 +17812,39 @@ var require_store = __commonJS({
       }
       return [...best.values(), ...others];
     }
+    function eventYears(promoKey) {
+      const list = promoKey === "ufc" ? bakedEvents() : baked(promoKey).movies;
+      const current = (/* @__PURE__ */ new Date()).getUTCFullYear();
+      const years = /* @__PURE__ */ new Set([current]);
+      for (const event of list) {
+        const year = Number(String(event.date || "").slice(0, 4));
+        if (year && year <= current) years.add(year);
+      }
+      return [...years].sort((a, b) => b - a).map(String);
+    }
+    function yearOf(iso) {
+      return Number(String(iso || "").slice(0, 4)) || null;
+    }
+    async function showsInYear(promoKey, year, client, { skipImdb = /* @__PURE__ */ new Set() } = {}) {
+      if (promoKey === "ufc") return [];
+      const y = Number(year);
+      const data = await promotionData(promoKey, client);
+      return data.tv.filter((show) => {
+        if (show.imdb && skipImdb.has(show.imdb)) return false;
+        const start = yearOf(show.premiered);
+        const end = show.inProduction ? (/* @__PURE__ */ new Date()).getUTCFullYear() : yearOf(show.ended);
+        return Boolean(start && end && start <= y && end >= y && (show.seasons || []).length);
+      }).sort((a, b) => b.seasons.length - a.seasons.length);
+    }
+    async function episodesInYear(tvId, year, client) {
+      const y = Number(year);
+      const episodes = await tvEpisodes(tvId, client, { year: y });
+      return episodes.filter((ep) => yearOf(ep.airdate) === y);
+    }
+    async function eventsInYear(promoKey, year, client) {
+      const events = promoKey === "ufc" ? await ufcEvents(client) : (await promotionData(promoKey, client)).movies;
+      return pastFirst(events.filter((event) => String(event.date || "").startsWith(`${year}-`)));
+    }
     function isValidUfcEvent(item) {
       return matches(UFC_EVENTS, item) && item.date && !franchises.isCompanion(item.name) && !franchises.isNoiseGenre(item);
     }
@@ -17884,6 +17920,10 @@ var require_store = __commonJS({
       ufcEvents,
       fetchUfcEvents,
       topEvents,
+      eventYears,
+      eventsInYear,
+      showsInYear,
+      episodesInYear,
       dedupeNumbered,
       ufcNumber,
       isRecent
@@ -17917,6 +17957,9 @@ var require_meta2 = __commonJS({
     function tvId(id) {
       return `${TV_PREFIX}${id}`;
     }
+    function yearShowId(showId, year) {
+      return `wwrs-yr-${showId}-${year}`;
+    }
     function franchiseId(promoKey, slug) {
       return `${FRANCHISE_PREFIX}${promoKey}-${slug}`;
     }
@@ -17931,6 +17974,8 @@ var require_meta2 = __commonJS({
       if (m) return { kind: "imdb", imdb: m[1] };
       m = clean.match(/^wwrs-ep-(\d+)-(\d+)-(\d+)$/);
       if (m) return { kind: "episode", tvId: Number(m[1]), season: Number(m[2]), number: Number(m[3]) };
+      m = clean.match(/^wwrs-yr-(\d+)-(\d{4})$/);
+      if (m) return { kind: "tvyear", tvId: Number(m[1]), year: Number(m[2]) };
       m = clean.match(/^wwrs-tv-(\d+)/);
       if (m) return { kind: "tv", id: Number(m[1]) };
       m = clean.match(/^wwrs-mv-(\d+)/);
@@ -17983,7 +18028,8 @@ var require_meta2 = __commonJS({
     var SHOW_TAGS = {
       ppv: "Eventos PPV / PLE",
       weekly: "Programas semanais",
-      collection: "Cole\xE7\xF5es por ano",
+      // "por evento": nao confundir com o catalogo "Por ano" (uma pasta por ano).
+      collection: "Cole\xE7\xF5es por evento",
       single: "Eventos individuais",
       running: "Em exibi\xE7\xE3o",
       archive: "Arquivo"
@@ -18094,6 +18140,47 @@ var require_meta2 = __commonJS({
         ...show.rating ? { imdbRating: String(show.rating) } : {},
         ...show.homepage ? { website: show.homepage } : {},
         videos
+      };
+    }
+    function yearShowDescription(show, promoKey, year, episodes) {
+      const promo = promotion2(promoKey);
+      const eps = Array.isArray(episodes) ? episodes : [];
+      const ultimo = eps.reduce((a, b) => !a || String(b.airdate || "") > String(a.airdate || "") ? b : a, null);
+      const ficha = [
+        promo ? `Promo\xE7\xE3o: ${promo.name}` : null,
+        show.network ? `Canal: ${show.network}` : null,
+        eps.length ? `Epis\xF3dios em ${year}: ${eps.length}` : null,
+        ultimo && ultimo.airdate ? `\xDAltimo: ${ptDate(ultimo.airdate)}` : null
+      ].filter(Boolean);
+      return joinLines([
+        `${show.name} \u2014 todos os epis\xF3dios de ${year}.`,
+        ficha.length ? `
+${ficha.join(" | ")}` : null,
+        show.summary ? `
+${show.summary}` : null
+      ]).trim();
+    }
+    function yearShowPreview(show, promoKey, year) {
+      return {
+        id: yearShowId(show.id, year),
+        type: "series",
+        name: `${show.name} \u2014 ${year}`,
+        ...show.poster ? { poster: show.poster } : {},
+        posterShape: "poster",
+        description: yearShowDescription(show, promoKey, year, null),
+        releaseInfo: String(year),
+        genres: genresFor({ ...show, kind: "tv" }, promoKey),
+        ...show.rating ? { imdbRating: String(show.rating) } : {}
+      };
+    }
+    function yearShowMeta(show, promoKey, year, episodes) {
+      const full = tvMeta(show, promoKey, episodes);
+      return {
+        ...full,
+        id: yearShowId(show.id, year),
+        name: `${show.name} \u2014 ${year}`,
+        description: yearShowDescription(show, promoKey, year, episodes),
+        releaseInfo: String(year)
       };
     }
     function episodeId(showId, episode) {
@@ -18276,6 +18363,9 @@ ${item.summary}` : null
       isUpcoming,
       preview,
       tvMeta,
+      yearShowId,
+      yearShowPreview,
+      yearShowMeta,
       episodeId,
       episodeMeta,
       franchiseMeta,
@@ -18838,6 +18928,17 @@ var require_catalogs = __commonJS({
         byDefault: true
       },
       {
+        token: "wweano",
+        id: "wwe_years",
+        type: "movie",
+        kind: "years",
+        promo: "wwe",
+        name: "WWE \u2014 Eventos por Ano",
+        label: "WWE \u2014 Raw, SmackDown, NXT\u2026 e eventos (PPV/PLE), uma pasta por ano (s\xF3 no Explorar)",
+        byDefault: true,
+        fightOnly: true
+      },
+      {
         token: "wwetop",
         id: "top_wwe",
         type: "movie",
@@ -18867,6 +18968,17 @@ var require_catalogs = __commonJS({
         name: "AEW \u2014 \xDAltimos 7 Dias",
         label: "AEW \u2014 epis\xF3dio mais recente da \xFAltima semana",
         byDefault: true
+      },
+      {
+        token: "aewano",
+        id: "aew_years",
+        type: "movie",
+        kind: "years",
+        promo: "aew",
+        name: "AEW \u2014 Eventos por Ano",
+        label: "AEW \u2014 Dynamite, Collision\u2026 e eventos (PPV), uma pasta por ano (s\xF3 no Explorar)",
+        byDefault: true,
+        fightOnly: true
       },
       {
         token: "aewtop",
@@ -18900,6 +19012,17 @@ var require_catalogs = __commonJS({
         byDefault: true
       },
       {
+        token: "tnaano",
+        id: "tna_years",
+        type: "movie",
+        kind: "years",
+        promo: "tna",
+        name: "TNA \u2014 Eventos por Ano",
+        label: "TNA \u2014 iMPACT!, Xplosion\u2026 e eventos (PPV), uma pasta por ano (s\xF3 no Explorar)",
+        byDefault: true,
+        fightOnly: true
+      },
+      {
         token: "tnatop",
         id: "top_tna",
         type: "movie",
@@ -18918,6 +19041,17 @@ var require_catalogs = __commonJS({
         name: "UFC \u2014 Eventos Numerados (mais recentes primeiro)",
         label: "UFC 330, UFC 329\u2026: eventos numerados (PPV), do mais recente para o mais antigo",
         byDefault: true
+      },
+      {
+        token: "ufcano",
+        id: "ufc_years",
+        type: "movie",
+        kind: "years",
+        promo: "ufc",
+        name: "UFC \u2014 Eventos por Ano",
+        label: "UFC \u2014 todos os eventos (numerados e Fight Night) numa pasta por ano (s\xF3 no Explorar)",
+        byDefault: true,
+        fightOnly: true
       },
       {
         token: "ufcfn",
@@ -18953,6 +19087,10 @@ var require_catalogs = __commonJS({
     var EN_TEXT = {
       wwe: ["WWE \u2014 Events & Shows", "WWE \u2014 every event (seasons and episodes)"],
       wwe7: ["WWE \u2014 Last 7 Days", "WWE \u2014 latest episode from the past week"],
+      wweano: ["WWE \u2014 Events by Year", "WWE \u2014 Raw, SmackDown, NXT\u2026 and events (PPV/PLE), one folder per year (Discover only)"],
+      aewano: ["AEW \u2014 Events by Year", "AEW \u2014 Dynamite, Collision\u2026 and events (PPV), one folder per year (Discover only)"],
+      tnaano: ["TNA \u2014 Events by Year", "TNA \u2014 iMPACT!, Xplosion\u2026 and events (PPV), one folder per year (Discover only)"],
+      ufcano: ["UFC \u2014 Events by Year", "UFC \u2014 every event (numbered and Fight Night) in one folder per year (Discover only)"],
       wwetop: ["WWE \u2014 Top 10 Events", "WWE \u2014 the 10 featured events (Discover only)"],
       aew: ["AEW \u2014 Events & Shows", "AEW \u2014 every event (seasons and episodes)"],
       aew7: ["AEW \u2014 Last 7 Days", "AEW \u2014 latest episode from the past week"],
@@ -18987,10 +19125,14 @@ var require_catalogs = __commonJS({
     var SHORT_NAMES = {
       wwe: "WWE",
       wwe7: "WWE \xB7 \xDAltimos 7 dias",
+      wweano: "WWE \xB7 Por ano",
       aew: "AEW",
       aew7: "AEW \xB7 \xDAltimos 7 dias",
+      aewano: "AEW \xB7 Por ano",
       tna: "TNA",
       tna7: "TNA \xB7 \xDAltimos 7 dias",
+      tnaano: "TNA \xB7 Por ano",
+      ufcano: "UFC \xB7 Por ano",
       wwetop: "WWE \xB7 Top 10",
       aewtop: "AEW \xB7 Top 10",
       tnatop: "TNA \xB7 Top 10",
@@ -19099,6 +19241,920 @@ var require_catalogs = __commonJS({
   }
 });
 
+// data/wwe-docs.json
+var require_wwe_docs = __commonJS({
+  "data/wwe-docs.json"(exports2, module2) {
+    module2.exports = [
+      {
+        key: "series:hulk hogan real american",
+        imdb: "tt41508977",
+        type: "series",
+        group: "wrestlers",
+        name: "Hulk Hogan: Real American",
+        year: 2026,
+        releaseInfo: "2026",
+        poster: "https://images.metahub.space/poster/small/tt41508977/img",
+        background: "https://images.metahub.space/background/medium/tt41508977/img",
+        summary: "Terry Bollea became Hulk Hogan. This unfiltered documentary reveals the man behind the legend through his final interview.",
+        rating: "7.5"
+      },
+      {
+        key: "movie:the heartbreak kid becoming shawn michaels",
+        imdb: "tt41355670",
+        type: "movie",
+        group: "wrestlers",
+        name: "The Heartbreak Kid: Becoming Shawn Michaels",
+        year: 2026,
+        releaseInfo: "2026",
+        poster: "https://live.metahub.space/poster/small/tt41355670/img",
+        background: "https://live.metahub.space/background/medium/tt41355670/img",
+        summary: "Follows the life and career of WWE performer Shawn Michaels, tracing his rise, personal struggles, and eventual comeback with an unfiltered look at his journey.",
+        rating: "6.8"
+      },
+      {
+        key: "series:wwe unreal",
+        imdb: "tt36614693",
+        type: "series",
+        group: "company",
+        name: "WWE: Unreal",
+        year: 2025,
+        releaseInfo: "2025\u20132026",
+        poster: "https://images.metahub.space/poster/small/tt36614693/img",
+        background: "https://images.metahub.space/background/medium/tt36614693/img",
+        summary: "Behind the scenes with WWE Superstars and staff from RAW to WrestleMania as they create wrestling's grandest events.",
+        rating: "8.0"
+      },
+      {
+        key: "series:mr mcmahon",
+        imdb: "tt33301469",
+        type: "series",
+        group: "wrestlers",
+        name: "Mr. McMahon",
+        year: 2024,
+        releaseInfo: "2024",
+        poster: "https://images.metahub.space/poster/small/tt33301469/img",
+        background: "https://images.metahub.space/background/medium/tt33301469/img",
+        summary: "WWE experienced record-breaking highs and crushing lows under Vince McMahon's leadership and the mogul's controversial reign.",
+        rating: "7.7"
+      },
+      {
+        key: "movie:bray wyatt becoming immortal",
+        imdb: "tt31823836",
+        type: "movie",
+        group: "wrestlers",
+        name: "Bray Wyatt: Becoming Immortal",
+        year: 2024,
+        releaseInfo: "2024",
+        poster: "https://live.metahub.space/poster/small/tt31823836/img",
+        background: "https://live.metahub.space/background/medium/tt31823836/img",
+        summary: "The story behind one of the most revered and mysterious characters in WWE history and the man himself, Windham Rotunda, has never been documented, until now.",
+        rating: "8.5"
+      },
+      {
+        key: "movie:american nightmare becoming cody rhodes",
+        imdb: "tt28427961",
+        type: "movie",
+        group: "wrestlers",
+        name: "American Nightmare: Becoming Cody Rhodes",
+        year: 2023,
+        releaseInfo: "2023",
+        poster: "https://images.metahub.space/poster/small/tt28427961/img",
+        background: "https://images.metahub.space/background/medium/tt28427961/img",
+        summary: "Documentary following the career of professional wrestler Cody Rhodes, from leaving the WWE to his eventual return to WrestleMania and his journey chasing the WWE championship - a feat his father, Dusty, never accomplished.",
+        rating: "7.8"
+      },
+      {
+        key: "movie:chyna wrestling with demons",
+        imdb: "tt30488066",
+        type: "movie",
+        group: "wrestlers",
+        name: "Chyna: Wrestling with Demons",
+        year: 2023,
+        releaseInfo: "2023",
+        poster: "https://m.media-amazon.com/images/M/MV5BYmY3NjI5NzUtNmU5MC00YmFmLWI1ZTgtOTAxMmJhMmEwZDFjXkEyXkFqcGc@._V1_SX250.jpg",
+        background: null,
+        summary: "",
+        rating: "6.6"
+      },
+      {
+        key: "movie:woooooo becoming ric flair",
+        imdb: "tt25151776",
+        type: "movie",
+        group: "wrestlers",
+        name: "Woooooo! Becoming Ric Flair",
+        year: 2022,
+        releaseInfo: "2022",
+        poster: "https://images.metahub.space/poster/small/tt25151776/img",
+        background: "https://images.metahub.space/background/medium/tt25151776/img",
+        summary: '"Nature Boy" Ric Flair, the most prolific and controversial Superstar in professional wrestling history, discusses his 50-year Hall of Fame career.',
+        rating: "7.4"
+      },
+      {
+        key: "series:wwe rivals",
+        imdb: "tt21104632",
+        type: "series",
+        group: "company",
+        name: "WWE Rivals",
+        year: 2022,
+        releaseInfo: "2022\u2013",
+        poster: "https://images.metahub.space/poster/small/tt21104632/img",
+        background: "https://images.metahub.space/background/medium/tt21104632/img",
+        summary: "Freddie Prinze Jr. leads a roundtable discussion of WWE luminaries to delve into the storylines and dynamic characters behind the epic battles that built the WWE.",
+        rating: "7.8"
+      },
+      {
+        key: "series:wwe evil",
+        imdb: "tt14627480",
+        type: "series",
+        group: "company",
+        name: "WWE Evil",
+        year: 2022,
+        releaseInfo: "2022\u2013",
+        poster: "https://images.metahub.space/poster/small/tt14627480/img",
+        background: "https://images.metahub.space/background/medium/tt14627480/img",
+        summary: "Chronicles the minds of the most diabolical antagonists in WWE history and their impact on mainstream culture.",
+        rating: null
+      },
+      {
+        key: "movie:vice versa chyna",
+        imdb: "tt14783560",
+        type: "movie",
+        group: "wrestlers",
+        name: "Vice Versa: Chyna",
+        year: 2021,
+        releaseInfo: "2021",
+        poster: "https://images.metahub.space/poster/small/tt14783560/img",
+        background: "https://images.metahub.space/background/medium/tt14783560/img",
+        summary: 'The rise and fall of wrestler Joanie Chyna Laurer, whose life was cut short in 2016. Her contributions to the WWE business and her pioneering work and her gripping tale of the "comeback" starting in 2015.',
+        rating: "7.3"
+      },
+      {
+        key: "series:biography wwe legends",
+        imdb: "tt14403784",
+        type: "series",
+        group: "company",
+        name: "Biography: WWE Legends",
+        year: 2021,
+        releaseInfo: "2021\u2013",
+        poster: "https://images.metahub.space/poster/small/tt14403784/img",
+        background: "https://images.metahub.space/background/medium/tt14403784/img",
+        summary: "Features eight original two-hour documentaries showcasing the stories behind some of the most memorable WWE Superstars of all time.",
+        rating: "8.4"
+      },
+      {
+        key: "series:undertaker the last ride",
+        imdb: "tt12269504",
+        type: "series",
+        group: "wrestlers",
+        name: "Undertaker: The Last Ride",
+        year: 2020,
+        releaseInfo: "2020\u20132020",
+        poster: "https://live.metahub.space/poster/small/tt12269504/img",
+        background: "https://live.metahub.space/background/medium/tt12269504/img",
+        summary: "The anticipated WWE Network docuseries will look back on The Undertaker\u2019s storied WWE career and place a focus on the ongoing challenges the wrestling legend appears to have with a career beginning to near it's end.",
+        rating: "8.7"
+      },
+      {
+        key: "series:wwe ruthless aggression",
+        imdb: "tt11958592",
+        type: "series",
+        group: "company",
+        name: "Ruthless Aggression",
+        year: 2020,
+        releaseInfo: "2020\u20132021",
+        poster: "https://live.metahub.space/poster/small/tt11958592/img",
+        background: "https://live.metahub.space/background/medium/tt11958592/img",
+        summary: "For the first time ever, hear the true stories from those who lived it, and witness the emergence of an entire new generation of Superstars, who would change WWE forever. WWE Ruthless Aggression will feature brand-new interviews with Cena, Batista, Orton, Triple H, Kurt Angle, Mark Henry, Becky Lynch, Kevin Owens, The Miz, Paul Heyman, Bruce Prichard and many more, giving WWE fans firsthand accounts of events that transpired in front of, and behind, the camera. Each episode is also packed with rare and never-before-seen footage, providing unprecedented access to the Ruthless Aggression Era.",
+        rating: "7.5"
+      },
+      {
+        key: "movie:bruno sammartino",
+        imdb: "tt7078318",
+        type: "movie",
+        group: "wrestlers",
+        name: "Bruno Sammartino",
+        year: 2019,
+        releaseInfo: "2019",
+        poster: "https://live.metahub.space/poster/small/tt7078318/img",
+        background: "https://live.metahub.space/background/medium/tt7078318/img",
+        summary: "A documentary about World Wrestling Federation Hall of Famer Bruno Sammartino.",
+        rating: "6.6"
+      },
+      {
+        key: "series:dark side of the ring",
+        imdb: "tt9159144",
+        type: "series",
+        group: "company",
+        name: "Dark Side of the Ring",
+        year: 2019,
+        releaseInfo: "2019\u2013",
+        poster: "https://images.metahub.space/poster/small/tt9159144/img",
+        background: "https://images.metahub.space/background/medium/tt9159144/img",
+        summary: "From backstage controversies to mysterious deaths and unsolved homicides, this series explores the darkest stories from the golden age of professional wrestling, and tries to find truth at the intersection of fantasy and reality.",
+        rating: "8.7"
+      },
+      {
+        key: "series:the broken skull sessions",
+        imdb: "tt11945438",
+        type: "series",
+        group: "company",
+        name: "Steve Austin's Broken Skull Sessions",
+        year: 2019,
+        releaseInfo: "2019\u20132022",
+        poster: "https://live.metahub.space/poster/small/tt11945438/img",
+        background: "https://live.metahub.space/background/medium/tt11945438/img",
+        summary: "Filmed at Austin\u2019s home studio in Southern California, each episode contains engaging, candid conversations with guests who\u2019ve accomplished success similar to the decorated six-time WWE Champion.",
+        rating: "8.4"
+      },
+      {
+        key: "movie:andre the giant",
+        imdb: "tt6543420",
+        type: "movie",
+        group: "wrestlers",
+        name: "Andre the Giant",
+        year: 2018,
+        releaseInfo: "2018",
+        poster: "https://images.metahub.space/poster/small/tt6543420/img",
+        background: "https://images.metahub.space/background/medium/tt6543420/img",
+        summary: "A look at the life and career of professional wrestler Andr\xE9 Roussimoff, who gained notoriety in the 1980s as Andre the Giant.",
+        rating: "7.8"
+      },
+      {
+        key: "series:wwe chronicle",
+        imdb: "tt12100340",
+        type: "series",
+        group: "company",
+        name: "WWE Chronicle",
+        year: 2018,
+        releaseInfo: "2018\u20132021",
+        poster: "https://live.metahub.space/poster/small/tt12100340/img",
+        background: "https://live.metahub.space/background/medium/tt12100340/img",
+        summary: "WWE Chronicle takes you inside the lives of WWE Superstars. Find out what it's really like to be in the WWE spotlight through revealing interviews and candid moments filmed backstage at WWE events, on the road, and in the Superstars' homes. This is a side of the men and women of WWE you've never seen before.",
+        rating: "6.9"
+      },
+      {
+        key: "series:wwe untold",
+        imdb: "tt11981130",
+        type: "series",
+        group: "company",
+        name: "WWE Untold",
+        year: 2018,
+        releaseInfo: "2018\u20132021",
+        poster: "https://live.metahub.space/poster/small/tt11981130/img",
+        background: "https://live.metahub.space/background/medium/tt11981130/img",
+        summary: "WWE Superstars past and present reveal their compelling stories about the most important moments in WWE history.",
+        rating: "7.9"
+      },
+      {
+        key: "movie:dusty rhodes celebrating the dream",
+        imdb: "tt4777520",
+        type: "movie",
+        group: "wrestlers",
+        name: "Dusty Rhodes: Celebrating the Dream",
+        year: 2015,
+        releaseInfo: "2015",
+        poster: "https://live.metahub.space/poster/small/tt4777520/img",
+        background: "https://live.metahub.space/background/medium/tt4777520/img",
+        summary: "A celebration of the life and career of the late, great WWE Hall of Famer, The American Dream Dusty Rhodes.",
+        rating: "6.2"
+      },
+      {
+        key: "movie:the resurrection of jake the snake",
+        imdb: "tt4016226",
+        type: "movie",
+        group: "wrestlers",
+        name: "The Resurrection of Jake the Snake",
+        year: 2015,
+        releaseInfo: "2015",
+        poster: "https://images.metahub.space/poster/small/tt4016226/img",
+        background: "https://images.metahub.space/background/medium/tt4016226/img",
+        summary: "A fallen professional wrestling superstar battles his past demons in a struggle to reclaim his life and the family that has given up on him.",
+        rating: "7.8"
+      },
+      {
+        key: "movie:daniel bryan just say yes yes yes",
+        imdb: "tt4709580",
+        type: "movie",
+        group: "wrestlers",
+        name: "Daniel Bryan: Just Say Yes! Yes! Yes!",
+        year: 2015,
+        releaseInfo: "2015",
+        poster: "https://images.metahub.space/poster/small/tt4709580/img",
+        background: "https://images.metahub.space/background/medium/tt4709580/img",
+        summary: "Daniel Bryan has shattered the mold of a WWE main event Superstar on the strength of one word- YES! Now, get a behind-the-scenes look at his incredible journey from his wrestling dreams as ...",
+        rating: "7.6"
+      },
+      {
+        key: "series:wwe 24",
+        imdb: "tt4662888",
+        type: "series",
+        group: "company",
+        name: "WWE 24",
+        year: 2015,
+        releaseInfo: "2015\u2013",
+        poster: "https://images.metahub.space/poster/small/tt4662888/img",
+        background: "https://images.metahub.space/background/medium/tt4662888/img",
+        summary: "A series of documentaries exclusive to the WWE Network, featuring a behind the scenes look at the superstars and events of the WWE.",
+        rating: "8.6"
+      },
+      {
+        key: "movie:warrior the ultimate legend",
+        imdb: "tt4033766",
+        type: "movie",
+        group: "wrestlers",
+        name: "Warrior: The Ultimate Legend",
+        year: 2014,
+        releaseInfo: "2014",
+        poster: "https://images.metahub.space/poster/small/tt4033766/img",
+        background: "https://images.metahub.space/background/medium/tt4033766/img",
+        summary: "Charismatic. Loner. Enigma. Warrior has been described many ways, but above them all is Legend. Examine the most outspoken and intense WWE Superstar of all time in this revealing documentary which examines the life, career and fin...",
+        rating: "8.2"
+      },
+      {
+        key: "movie:macho man the randy savage story",
+        imdb: "tt3970576",
+        type: "movie",
+        group: "wrestlers",
+        name: "Macho Man: The Randy Savage Story",
+        year: 2014,
+        releaseInfo: "2014",
+        poster: "https://images.metahub.space/poster/small/tt3970576/img",
+        background: "https://images.metahub.space/background/medium/tt3970576/img",
+        summary: "WWE fans, you have waited long enough! His glistening wardrobe, often-imitated cadence and grandiose style was outshined only by his virtuoso performances in the ring. Macho Man, with his ...",
+        rating: "7.8"
+      },
+      {
+        key: "series:the monday night war wwe vs wcw",
+        imdb: "tt4009520",
+        type: "series",
+        group: "company",
+        name: "The Monday Night War: WWE vs. WCW",
+        year: 2014,
+        releaseInfo: "2014\u2013",
+        poster: "https://images.metahub.space/poster/small/tt4009520/img",
+        background: "https://images.metahub.space/background/medium/tt4009520/img",
+        summary: "A documentary about the period in sports entertainment, known as the Monday Night Wars. Includes interviews with past and present on-air personalities. Also includes looking back on superstars and storylines that made the Monday N...",
+        rating: "8.4"
+      },
+      {
+        key: "movie:triple h thy kingdom come",
+        imdb: "tt3103128",
+        type: "movie",
+        group: "wrestlers",
+        name: "WWE: Triple H - Thy Kingdom Come",
+        year: 2013,
+        releaseInfo: "2013",
+        poster: "https://images.metahub.space/poster/small/tt3103128/img",
+        background: "https://images.metahub.space/background/medium/tt3103128/img",
+        summary: "In this rare match from his earliest days in sports entertainment, the man who would was not yet known as The Game takes on the legendary Ricky Steamboat on WCW Saturday Night.",
+        rating: "8.0"
+      },
+      {
+        key: "movie:the epic journey of dwayne the rock johnson",
+        imdb: "tt2198229",
+        type: "movie",
+        group: "wrestlers",
+        name: "The Epic Journey of Dwayne 'The Rock' Johnson",
+        year: 2012,
+        releaseInfo: "2012",
+        poster: "https://images.metahub.space/poster/small/tt2198229/img",
+        background: "https://images.metahub.space/background/medium/tt2198229/img",
+        summary: "Finally...the Rock has come back to WWE and finally...the Rock's story is being told in its entirety! From growing up in a sports entertainment family to playing Division 1 NCAA football at...",
+        rating: "8.0"
+      },
+      {
+        key: "movie:rock vs cena once in a lifetime",
+        imdb: "tt2720954",
+        type: "movie",
+        group: "wrestlers",
+        name: "Rock vs. Cena: Once in a Lifetime",
+        year: 2012,
+        releaseInfo: "2012",
+        poster: "https://images.metahub.space/poster/small/tt2720954/img",
+        background: "https://images.metahub.space/background/medium/tt2720954/img",
+        summary: "THIS is a ONCE IN A LIFETIME story of two transcendent Superstars divided by polar opposite backgrounds, yet magnetized by equally larger-than-life personas. The Rock returns to the land he...",
+        rating: "6.7"
+      },
+      {
+        key: "movie:cm punk best in the world",
+        imdb: "tt2322674",
+        type: "movie",
+        group: "wrestlers",
+        name: "WWE: CM Punk - Best in the World",
+        year: 2012,
+        releaseInfo: "2012",
+        poster: "https://images.metahub.space/poster/small/tt2322674/img",
+        background: "https://images.metahub.space/background/medium/tt2322674/img",
+        summary: "For the first time ever, experience the rise of CM Punk with CM Punk: Best in the World! From his early days in the Indy circuit to his explosive transformation into the most unabashed, ...",
+        rating: "8.5"
+      },
+      {
+        key: "movie:the attitude era",
+        imdb: "tt2437710",
+        type: "movie",
+        group: "company",
+        name: "Attitude Era",
+        year: 2012,
+        releaseInfo: "2012",
+        poster: "https://images.metahub.space/poster/small/tt2437710/img",
+        background: "https://images.metahub.space/background/medium/tt2437710/img",
+        summary: "A look at the highest rated period in the history of professional wrestling.",
+        rating: "7.7"
+      },
+      {
+        key: "movie:stone cold steve austin the bottom line on the most popular superstar of all time",
+        imdb: "tt2087951",
+        type: "movie",
+        group: "wrestlers",
+        name: "Stone Cold Steve Austin: The Bottom Line on the Most Popular Superstar of All Time",
+        year: 2011,
+        releaseInfo: "2011",
+        poster: "https://images.metahub.space/poster/small/tt2087951/img",
+        background: "https://images.metahub.space/background/medium/tt2087951/img",
+        summary: "At his apex, Stone Cold Steve Austin was a pop culture phenomenon, the biggest superstar in the history of sports entertainment.",
+        rating: "8.3"
+      },
+      {
+        key: "movie:randy orton the evolution of a predator",
+        imdb: "tt2011200",
+        type: "movie",
+        group: "wrestlers",
+        name: "Randy Orton: The Evolution of a Predator",
+        year: 2011,
+        releaseInfo: "2011",
+        poster: "https://images.metahub.space/poster/small/tt2011200/img",
+        background: "https://images.metahub.space/background/medium/tt2011200/img",
+        summary: "He's one of the most dangerous competitors in the history of WWE. He's relentless and remorseless; the Apex Predator. Randy Orton can end matches in the blink of an eye with his devastating...",
+        rating: "7.0"
+      },
+      {
+        key: "movie:rey mysterio the life of a masked man",
+        imdb: "tt1959604",
+        type: "movie",
+        group: "wrestlers",
+        name: "WWE: Rey Mysterio - The Life of a Masked Man",
+        year: 2011,
+        releaseInfo: "2011",
+        poster: "https://images.metahub.space/poster/small/tt1959604/img",
+        background: "https://images.metahub.space/background/medium/tt1959604/img",
+        summary: "For the first time ever, Rey Mysterio, perhaps the greatest high flyer in the annals of sports entertainment, sits down and discusses his historic career in never-before-seen interviews. ...",
+        rating: "6.9"
+      },
+      {
+        key: "movie:the true story of wrestlemania",
+        imdb: "tt1843301",
+        type: "movie",
+        group: "company",
+        name: "The True Story of WrestleMania",
+        year: 2011,
+        releaseInfo: "2011",
+        poster: "https://images.metahub.space/poster/small/tt1843301/img",
+        background: "https://images.metahub.space/background/medium/tt1843301/img",
+        summary: "It is the most anticipated yearly event in Sports Entertainment, an annual pop culture touch point. For more than 25 years, WrestleMania has hosted the biggest matches, the biggest stars, ...",
+        rating: "7.5"
+      },
+      {
+        key: "movie:bret hart survival of the hitman",
+        imdb: "tt3882542",
+        type: "movie",
+        group: "wrestlers",
+        name: "Survival Of The Hitman",
+        year: 2010,
+        releaseInfo: "2010",
+        poster: "https://live.metahub.space/poster/small/tt3882542/img",
+        background: "https://live.metahub.space/background/medium/tt3882542/img",
+        summary: "Survival of the Hitman chronicles the life and pro wrestling career of Bret The Hitman Hart. It profiles his rise in the World Wrestling Federation, his bitter departure following the infamous Montreal Screwjob in 1997 and his return to the WWE in 2010.",
+        rating: "6.1"
+      },
+      {
+        key: "movie:hart and soul the hart family anthology",
+        imdb: "tt1611851",
+        type: "movie",
+        group: "wrestlers",
+        name: "Hart and Soul: The Hart Family Anthology",
+        year: 2010,
+        releaseInfo: "2010",
+        poster: "https://images.metahub.space/poster/small/tt1611851/img",
+        background: "https://images.metahub.space/background/medium/tt1611851/img",
+        summary: "The Hart Family has long served as Canada's first family of sports entertainment; from patriarch Stu Hart and his Stampede wrestling and Dungeon, a training site that has produced multiple ...",
+        rating: "7.6"
+      },
+      {
+        key: "movie:breaking the code behind the walls of chris jericho",
+        imdb: "tt1712167",
+        type: "movie",
+        group: "wrestlers",
+        name: "Breaking the Code: Behind the Walls of Chris Jericho",
+        year: 2010,
+        releaseInfo: "2010",
+        poster: "https://images.metahub.space/poster/small/tt1712167/img",
+        background: "https://images.metahub.space/background/medium/tt1712167/img",
+        summary: "For nearly twenty years, Chris Jericho has stolen the spotlight, becoming one of the most recognized Superstars in sports-entertainment history. Now fans can learn his entire life story, ...",
+        rating: "7.9"
+      },
+      {
+        key: "movie:finding hulk hogan",
+        imdb: "tt1772266",
+        type: "movie",
+        group: "wrestlers",
+        name: "Finding Hulk Hogan",
+        year: 2010,
+        releaseInfo: "2010",
+        poster: "https://images.metahub.space/poster/small/tt1772266/img",
+        background: "https://images.metahub.space/background/medium/tt1772266/img",
+        summary: "Hulk Hogan explores the rise and fall of both his personal life and career as he prepares for a return to the professional wrestling business with TNA Wrestling.",
+        rating: "6.5"
+      },
+      {
+        key: "movie:batista i walk alone",
+        imdb: "tt1515969",
+        type: "movie",
+        group: "wrestlers",
+        name: "WWE: Batista - I Walk Alone",
+        year: 2009,
+        releaseInfo: "2009",
+        poster: "https://images.metahub.space/poster/small/tt1515969/img",
+        background: "https://images.metahub.space/background/medium/tt1515969/img",
+        summary: "The career retrospective of the Animal Batista",
+        rating: "7.1"
+      },
+      {
+        key: "movie:the rise and fall of wcw",
+        imdb: "tt1483817",
+        type: "movie",
+        group: "company",
+        name: "WWE: The Rise and Fall of WCW",
+        year: 2009,
+        releaseInfo: "2009",
+        poster: "https://images.metahub.space/poster/small/tt1483817/img",
+        background: "https://images.metahub.space/background/medium/tt1483817/img",
+        summary: "The Rise & Fall of WCW examines the storied history of World Championship Wrestling, from its beginnings in the territory system through Ted Turner's acquisition and the savage battles with...",
+        rating: "7.5"
+      },
+      {
+        key: "movie:the legacy of stone cold steve austin",
+        imdb: "tt1332547",
+        type: "movie",
+        group: "wrestlers",
+        name: "The Legacy of Stone Cold Steve Austin",
+        year: 2008,
+        releaseInfo: "2008",
+        poster: "https://images.metahub.space/poster/small/tt1332547/img",
+        background: "https://images.metahub.space/background/medium/tt1332547/img",
+        summary: "",
+        rating: "7.8"
+      },
+      {
+        key: "movie:twist of fate the matt and jeff hardy story",
+        imdb: "tt1346324",
+        type: "movie",
+        group: "wrestlers",
+        name: "WWE: Twist of Fate - The Matt and Jeff Hardy Story",
+        year: 2008,
+        releaseInfo: "2008",
+        poster: "https://images.metahub.space/poster/small/tt1346324/img",
+        background: "https://images.metahub.space/background/medium/tt1346324/img",
+        summary: "Twist of Fate: The Matt and Jeff Hardy Story includes two features in one--as each brother gets a chance to shine in the spotlight. First Matt Hardy was born to wrestler--from his earliest ...",
+        rating: "7.1"
+      },
+      {
+        key: "movie:edge a decade of decadence",
+        imdb: "tt1359593",
+        type: "movie",
+        group: "wrestlers",
+        name: "WWE Edge: A Decade of Decadence",
+        year: 2008,
+        releaseInfo: "2008",
+        poster: "https://images.metahub.space/poster/small/tt1359593/img",
+        background: "https://images.metahub.space/background/medium/tt1359593/img",
+        summary: "Love him or hate him, you cannot deny the impact EDGE has had on WWE. He is responsible for some of the most infamous moments in sports entertainment history. Utilizing his incredible ...",
+        rating: "7.8"
+      },
+      {
+        key: "movie:shawn michaels heartbreak and triumph",
+        imdb: "tt1277734",
+        type: "movie",
+        group: "wrestlers",
+        name: "The Shawn Michaels Story: Heartbreak and Triumph",
+        year: 2007,
+        releaseInfo: "2007",
+        poster: "https://images.metahub.space/poster/small/tt1277734/img",
+        background: "https://images.metahub.space/background/medium/tt1277734/img",
+        summary: "He is one of the most charismatic showmen ever to grace a WWE ring. He is HBK: The Heartbreak Kid - the most resilient champion in WWE. And pound for pound, he may well be the toughest. He ...",
+        rating: "8.2"
+      },
+      {
+        key: "movie:the american dream the dusty rhodes story",
+        imdb: "tt0940650",
+        type: "movie",
+        group: "wrestlers",
+        name: "The American Dream: The Dusty Rhodes Story",
+        year: 2006,
+        releaseInfo: "2006",
+        poster: "https://images.metahub.space/poster/small/tt0940650/img",
+        background: "https://images.metahub.space/background/medium/tt0940650/img",
+        summary: "Chronicles Stories Of The American Dream Dusty Rhoades.",
+        rating: "7.4"
+      },
+      {
+        key: "movie:brian pillman loose cannon",
+        imdb: "tt0932958",
+        type: "movie",
+        group: "wrestlers",
+        name: "Brian Pillman: Loose Cannon",
+        year: 2006,
+        releaseInfo: "2006",
+        poster: "https://images.metahub.space/poster/small/tt0932958/img",
+        background: "https://images.metahub.space/background/medium/tt0932958/img",
+        summary: "A history of the career of Flyin' Brian Pillman from WCW days to the WWE.",
+        rating: "7.9"
+      },
+      {
+        key: "movie:the bret hart story the best there is the best there was the best there ever will be",
+        imdb: "tt0296523",
+        type: "movie",
+        group: "wrestlers",
+        name: "The Bret Hart Story: The Best There Is, the Best There Was, the Best There Ever Will Be",
+        year: 2005,
+        releaseInfo: "2005",
+        poster: "https://images.metahub.space/poster/small/tt0296523/img",
+        background: "https://images.metahub.space/background/medium/tt0296523/img",
+        summary: "Bret portrays in his own words, how he became: The best there is, the best there was and the best there ever will be.",
+        rating: "8.4"
+      },
+      {
+        key: "movie:the self destruction of the ultimate warrior",
+        imdb: "tt0481960",
+        type: "movie",
+        group: "wrestlers",
+        name: "The Self Destruction of the Ultimate Warrior",
+        year: 2005,
+        releaseInfo: "2005",
+        poster: "https://images.metahub.space/poster/small/tt0481960/img",
+        background: "https://images.metahub.space/background/medium/tt0481960/img",
+        summary: "The Ultimate Warrior's meteoric rise to fame and fortune following his defeat of Hulk Hogan, his rivalries with other wrestlers such as Randy Savage and Rick Rude, and his rapid burn-out when the pressures of fame got too much for him.",
+        rating: "6.9"
+      },
+      {
+        key: "movie:eddie guerrero cheating death stealing life",
+        imdb: "tt0471614",
+        type: "movie",
+        group: "wrestlers",
+        name: "Cheating Death, Stealing Life: The Eddie Guerrero Story",
+        year: 2004,
+        releaseInfo: "2004",
+        poster: "https://live.metahub.space/poster/small/tt0471614/img",
+        background: "https://live.metahub.space/background/medium/tt0471614/img",
+        summary: "The highs and lows in the life of WWE Champion Eddie Guerrero are explored.",
+        rating: "7.8"
+      },
+      {
+        key: "movie:mick foley s greatest hits and misses a life in wrestling",
+        imdb: "tt0416980",
+        type: "movie",
+        group: "wrestlers",
+        name: "Mick Foley's Greatest Hits & Misses: A Life in Wrestling",
+        year: 2004,
+        releaseInfo: "2004",
+        poster: "https://images.metahub.space/poster/small/tt0416980/img",
+        background: "https://images.metahub.space/background/medium/tt0416980/img",
+        summary: "Matches Included.",
+        rating: "8.2"
+      },
+      {
+        key: "movie:the rise and fall of ecw",
+        imdb: "tt0440751",
+        type: "movie",
+        group: "company",
+        name: "The Rise & Fall of ECW",
+        year: 2004,
+        releaseInfo: "2004",
+        poster: "https://images.metahub.space/poster/small/tt0440751/img",
+        background: "https://images.metahub.space/background/medium/tt0440751/img",
+        summary: "A documentary on the rise and fall of cult wrestling federation ECW",
+        rating: "8.5"
+      },
+      {
+        key: "movie:brock lesnar here comes the pain",
+        imdb: "tt0378997",
+        type: "movie",
+        group: "wrestlers",
+        name: "WWE: Brock Lesnar: Here Comes the Pain",
+        year: 2003,
+        releaseInfo: "2003",
+        poster: "https://images.metahub.space/poster/small/tt0378997/img",
+        background: "https://images.metahub.space/background/medium/tt0378997/img",
+        summary: "The pain is back! Eight years after hitting the WWE with F-5 fury, Brock Lesnar has returned to deliver destruction to the WWE Universe for a second time. Brock Lesnar Here Comes the Pain! ...",
+        rating: "7.0"
+      },
+      {
+        key: "movie:beyond the mat",
+        imdb: "tt0218043",
+        type: "movie",
+        group: "company",
+        name: "Beyond the Mat",
+        year: 1999,
+        releaseInfo: "1999",
+        poster: "https://images.metahub.space/poster/small/tt0218043/img",
+        background: "https://images.metahub.space/background/medium/tt0218043/img",
+        summary: "A heartfelt documentary focusing on the day-to-day lives of professional wrestlers, some on the rise, some on the wane, and others fighting for their lives.",
+        rating: "7.6"
+      },
+      {
+        key: "movie:hitman hart wrestling with shadows",
+        imdb: "tt0179218",
+        type: "movie",
+        group: "wrestlers",
+        name: "Hitman Hart: Wrestling with Shadows",
+        year: 1998,
+        releaseInfo: "1998",
+        poster: "https://live.metahub.space/poster/small/tt0179218/img",
+        background: "https://live.metahub.space/background/medium/tt0179218/img",
+        summary: "This documentary follows superstar Bret Hart during his last year in the WWF. The film documents the tensions that resulted in The Montreal Screwjob, one of the most controversial events in the history of professional wrestling, in which Vince McMahon, Shawn Micheals, and others, legitimately conspired behind the scenes to go against the script and remove Bret Hart as champion.",
+        rating: "8.0"
+      }
+    ];
+  }
+});
+
+// lib/documentaries.js
+var require_documentaries = __commonJS({
+  "lib/documentaries.js"(exports2, module2) {
+    var { getJson, mapLimit } = require_httpx();
+    var cache = require_cache();
+    var BASE = "https://v3-cinemeta.strem.io";
+    var HOUR = 60 * 60 * 1e3;
+    var TTL = 24 * HOUR;
+    var FIRST_WAIT_MS = 8e3;
+    var GENRE = "Document\xE1rios";
+    var GROUPS = {
+      wrestlers: "Lutadores",
+      company: "Hist\xF3ria da WWE"
+    };
+    var bakedDocs = require_wwe_docs();
+    var DOCUMENTARIES = [
+      // ---- lutadores ----
+      { title: "Mr. McMahon", type: "series", year: 2024, group: "wrestlers" },
+      { title: "Undertaker: The Last Ride", query: "Last Ride", match: "last ride", type: "series", year: 2020, group: "wrestlers" },
+      { title: "Hulk Hogan: Real American", query: "Hulk Hogan", match: "hulk hogan", type: "series", year: 2025, group: "wrestlers" },
+      { title: "The Heartbreak Kid: Becoming Shawn Michaels", query: "Shawn Michaels", match: "becoming shawn michaels", type: "movie", year: 2026, group: "wrestlers" },
+      { title: "American Nightmare: Becoming Cody Rhodes", query: "Cody Rhodes", match: "becoming cody rhodes", type: "movie", year: 2023, group: "wrestlers" },
+      { title: "Andre the Giant", type: "movie", year: 2018, group: "wrestlers" },
+      { title: "The Epic Journey of Dwayne 'The Rock' Johnson", query: "Dwayne The Rock Johnson", match: "epic journey of dwayne", type: "movie", year: 2012, group: "wrestlers" },
+      { title: "Rock vs. Cena: Once in a Lifetime", query: "Rock Cena", match: "once in a lifetime", type: "movie", year: 2012, group: "wrestlers" },
+      { title: "Bruno Sammartino", type: "movie", year: 2019, group: "wrestlers" },
+      { title: "Vice Versa: Chyna", query: "Chyna", match: "vice versa chyna", type: "movie", year: 2021, group: "wrestlers" },
+      { title: "The Legacy of Stone Cold Steve Austin", query: "Steve Austin", match: "legacy of stone cold", type: "movie", year: 2008, group: "wrestlers" },
+      { title: "Brock Lesnar: Here Comes the Pain", query: "Brock Lesnar", match: "here comes the pain", type: "movie", year: 2003, group: "wrestlers" },
+      { title: "Twist of Fate: The Matt and Jeff Hardy Story", query: "Jeff Hardy", match: "twist of fate", type: "movie", year: 2008, group: "wrestlers" },
+      { title: "The Bret Hart Story: The Best There Is, the Best There Was, the Best There Ever Will Be", query: "Bret Hart", match: "bret hart story", type: "movie", year: 2005, group: "wrestlers" },
+      { title: "Dusty Rhodes: Celebrating the Dream", query: "Dusty Rhodes", match: "celebrating the dream", type: "movie", year: 2015, group: "wrestlers" },
+      { title: "Woooooo! Becoming Ric Flair", query: "Ric Flair", match: "becoming ric flair", type: "movie", year: 2022, group: "wrestlers" },
+      { title: "Bray Wyatt: Becoming Immortal", query: "Bray Wyatt", match: "becoming immortal", type: "movie", year: 2024, group: "wrestlers" },
+      { title: "Chyna: Wrestling with Demons", query: "Chyna", match: "wrestling with demons", type: "movie", year: 2023, group: "wrestlers" },
+      { title: "The Resurrection of Jake the Snake", query: "Jake the Snake", match: "jake the snake", type: "movie", year: 2015, group: "wrestlers" },
+      { title: "Hitman Hart: Wrestling with Shadows", match: "wrestling with shadows", type: "movie", year: 1998, group: "wrestlers" },
+      { title: "Bret Hart: Survival of the Hitman", query: "Survival of the Hitman", match: "survival of the hitman", type: "movie", year: 2010, group: "wrestlers" },
+      { title: "Hart & Soul: The Hart Family Anthology", match: "hart family", type: "movie", year: 2010, group: "wrestlers" },
+      { title: "The Self Destruction of the Ultimate Warrior", query: "Self Destruction", match: "self destruction of the ultimate warrior", type: "movie", year: 2005, group: "wrestlers" },
+      { title: "Warrior: The Ultimate Legend", match: "ultimate legend", type: "movie", year: 2014, group: "wrestlers" },
+      { title: "Stone Cold Steve Austin: The Bottom Line on the Most Popular Superstar of All Time", match: "bottom line", type: "movie", year: 2011, group: "wrestlers" },
+      { title: "Shawn Michaels: Heartbreak & Triumph", match: "heartbreak", type: "movie", year: 2007, group: "wrestlers" },
+      { title: "Triple H: Thy Kingdom Come", match: "thy kingdom come", type: "movie", year: 2013, group: "wrestlers" },
+      { title: "CM Punk: Best in the World", match: "best in the world", type: "movie", year: 2012, group: "wrestlers" },
+      { title: "Daniel Bryan: Just Say Yes! Yes! Yes!", match: "just say yes", type: "movie", year: 2015, group: "wrestlers" },
+      { title: "Batista: I Walk Alone", match: "i walk alone", type: "movie", year: 2009, group: "wrestlers" },
+      { title: "Randy Orton: The Evolution of a Predator", match: "evolution of a predator", type: "movie", year: 2012, group: "wrestlers" },
+      { title: "Rey Mysterio: The Life of a Masked Man", match: "life of a masked man", type: "movie", year: 2011, group: "wrestlers" },
+      { title: "Eddie Guerrero: Cheating Death, Stealing Life", match: "cheating death", type: "movie", year: 2004, group: "wrestlers" },
+      { title: "Mick Foley's Greatest Hits & Misses: A Life in Wrestling", query: "Mick Foley", match: "greatest hits", type: "movie", year: 2004, group: "wrestlers" },
+      { title: "Macho Man: The Randy Savage Story", query: "Randy Savage", match: "randy savage story", type: "movie", year: 2014, group: "wrestlers" },
+      { title: "The American Dream: The Dusty Rhodes Story", match: "dusty rhodes", type: "movie", year: 2006, group: "wrestlers" },
+      { title: "Edge: A Decade of Decadence", match: "decade of decadence", type: "movie", year: 2008, group: "wrestlers" },
+      { title: "Breaking the Code: Behind the Walls of Chris Jericho", query: "Chris Jericho", match: "breaking the code", type: "movie", year: 2010, group: "wrestlers" },
+      { title: "Brian Pillman: Loose Cannon", query: "Brian Pillman", match: "loose cannon", type: "movie", year: 2006, group: "wrestlers" },
+      { title: "Finding Hulk Hogan", query: "Hulk Hogan", type: "movie", year: 2010, group: "wrestlers" },
+      // ---- historia da WWE ----
+      { title: "WWE: Unreal", match: "unreal", type: "series", year: 2025, group: "company" },
+      { title: "WWE 24", type: "series", year: 2015, group: "company" },
+      { title: "WWE Chronicle", type: "series", year: 2018, group: "company" },
+      { title: "WWE Untold", type: "series", year: 2018, group: "company" },
+      { title: "WWE Ruthless Aggression", match: "ruthless aggression", type: "series", year: 2020, group: "company" },
+      { title: "Biography: WWE Legends", match: "wwe legends", type: "series", year: 2021, group: "company" },
+      { title: "WWE Rivals", match: "rivals", type: "series", year: 2022, group: "company" },
+      { title: "WWE Evil", type: "series", year: 2022, group: "company" },
+      { title: "The Monday Night War: WWE vs. WCW", match: "monday night war", type: "series", year: 2014, group: "company" },
+      { title: "Dark Side of the Ring", type: "series", year: 2019, group: "company" },
+      { title: "The Broken Skull Sessions", match: "broken skull", type: "series", year: 2019, group: "company" },
+      { title: "Beyond the Mat", type: "movie", year: 1999, group: "company" },
+      { title: "The Rise and Fall of ECW", match: "rise and fall of ecw", type: "movie", year: 2004, group: "company" },
+      { title: "The Rise and Fall of WCW", match: "rise and fall of wcw", type: "movie", year: 2009, group: "company" },
+      { title: "The True Story of WrestleMania", match: "true story of wrestlemania", type: "movie", year: 2011, group: "company" },
+      { title: "The Attitude Era", match: "attitude era", type: "movie", year: 2012, group: "company" }
+    ];
+    function normalize(text) {
+      return String(text || "").toLowerCase().normalize("NFD").replace(new RegExp("\\p{M}", "gu"), "").replace(/&/g, " and ").replace(/[^a-z0-9]+/g, " ").trim();
+    }
+    function keyOf(doc) {
+      return `${doc.type}:${normalize(doc.title)}`;
+    }
+    function yearOf(text) {
+      const m = String(text || "").match(/(\d{4})/);
+      return m ? Number(m[1]) : null;
+    }
+    function pick(doc, metas) {
+      const needle = normalize(doc.match || doc.title);
+      const full = normalize(doc.title);
+      let best = null;
+      let bestScore = -1;
+      for (const meta of metas || []) {
+        if (!/^tt\d+$/.test(String(meta.id || ""))) continue;
+        const name = normalize(meta.name);
+        if (!name.includes(needle)) continue;
+        const year = yearOf(meta.releaseInfo || meta.year);
+        if (doc.year && year && Math.abs(year - doc.year) > 1) continue;
+        const score = (name === full ? 4 : 0) + (doc.year && year === doc.year ? 2 : 0) + (meta.poster ? 1 : 0);
+        if (score > bestScore) {
+          best = meta;
+          bestScore = score;
+        }
+      }
+      return best;
+    }
+    async function resolve(doc) {
+      const url = `${BASE}/catalog/${doc.type}/top/search=${encodeURIComponent(doc.query || doc.title)}.json`;
+      const found = await getJson(url, { timeout: 15e3, retries: 2 });
+      const hit = pick(doc, found && found.metas);
+      if (!hit) return null;
+      const full = await getJson(`${BASE}/meta/${doc.type}/${hit.id}.json`, { timeout: 15e3, retries: 2 });
+      const meta = full && full.meta || hit;
+      const year = yearOf(meta.releaseInfo || meta.year);
+      if (doc.year && year && Math.abs(year - doc.year) > 1) return null;
+      return {
+        key: keyOf(doc),
+        imdb: hit.id,
+        type: doc.type,
+        group: doc.group,
+        name: String(meta.name || hit.name || doc.title).trim(),
+        year: yearOf(meta.releaseInfo || meta.year) || doc.year || null,
+        releaseInfo: meta.releaseInfo || (meta.year ? String(meta.year) : doc.year ? String(doc.year) : null),
+        poster: meta.poster || hit.poster || null,
+        background: meta.background || null,
+        summary: String(meta.description || "").trim(),
+        rating: meta.imdbRating || null
+      };
+    }
+    function baked() {
+      return Array.isArray(bakedDocs) ? bakedDocs : [];
+    }
+    async function resolveAll({ skipBaked = true } = {}) {
+      const have = new Map(skipBaked ? baked().map((d) => [d.key, d]) : []);
+      const missing = DOCUMENTARIES.filter((doc) => !have.has(keyOf(doc)));
+      const found = await mapLimit(missing, 2, 250, resolve);
+      missing.forEach((doc, i) => {
+        if (found[i]) have.set(keyOf(doc), found[i]);
+      });
+      const seen = /* @__PURE__ */ new Set();
+      const out = [];
+      for (const doc of DOCUMENTARIES) {
+        const item = have.get(keyOf(doc));
+        if (!item || seen.has(item.imdb)) continue;
+        seen.add(item.imdb);
+        out.push(item);
+      }
+      return out.sort((a, b) => (b.year || 0) - (a.year || 0));
+    }
+    async function list() {
+      const stored = baked();
+      const complete = DOCUMENTARIES.every((doc) => stored.some((d) => d.key === keyOf(doc)));
+      if (complete) return resolveAll();
+      const pending = cache.memo("docs:wwe", TTL, () => resolveAll(), { staleMs: 7 * 24 * HOUR });
+      const timeout = new Promise((r) => setTimeout(() => r(null), FIRST_WAIT_MS));
+      const value = await Promise.race([pending.catch(() => null), timeout]);
+      return value || stored;
+    }
+    function imdbSet() {
+      return new Set(baked().map((doc) => doc.imdb));
+    }
+    function preview(doc) {
+      const group = GROUPS[doc.group] || null;
+      return {
+        id: doc.imdb,
+        type: doc.type,
+        name: doc.name,
+        poster: doc.poster || `https://images.metahub.space/poster/medium/${doc.imdb}/img`,
+        posterShape: "poster",
+        ...doc.background ? { background: doc.background } : {},
+        description: [group ? `Document\xE1rio \xB7 ${group}` : "Document\xE1rio", doc.summary].filter(Boolean).join("\n\n"),
+        ...doc.releaseInfo ? { releaseInfo: doc.releaseInfo } : {},
+        genres: ["Wrestling", "WWE", GENRE, ...group ? [group] : []],
+        ...doc.rating ? { imdbRating: String(doc.rating) } : {}
+      };
+    }
+    module2.exports = { GENRE, GROUPS, DOCUMENTARIES, list, resolveAll, preview, keyOf, imdbSet };
+  }
+});
+
 // index.js
 var http = require("http");
 var fs = require("fs");
@@ -19116,6 +20172,7 @@ async function youtubeVideos(ctx) {
   return Promise.race([pending, timeout]);
 }
 var catalogs = require_catalogs();
+var documentaries = require_documentaries();
 var { promotion } = require_promotions();
 var DEFAULT_PORT = Number(process.env.PORT) || 7100;
 var HOST = "0.0.0.0";
@@ -19304,6 +20361,8 @@ function fallbackPoster(originBase, title, subtitle, tone) {
 function genreOptions(def) {
   if (def.kind === "promo") {
     return [
+      // Documentarios (lutadores e historia da empresa): a "subpasta" da WWE.
+      ...def.promo === "wwe" ? [documentaries.GENRE] : [],
       metaBuilder.SHOW_TAGS.ppv,
       metaBuilder.SHOW_TAGS.weekly,
       metaBuilder.SHOW_TAGS.collection,
@@ -19312,6 +20371,7 @@ function genreOptions(def) {
       metaBuilder.SHOW_TAGS.archive
     ];
   }
+  if (def.kind === "years") return store.eventYears(def.promo);
   if (def.kind === "ufc") return [metaBuilder.UFC_TAGS.upcoming];
   if (def.kind === "ufcfn") {
     return [
@@ -19326,7 +20386,9 @@ function genreOptions(def) {
 function catalogExtras(def, fight) {
   const extras = [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }];
   const options = genreOptions(def);
-  if (fight) {
+  if (def.kind === "years") {
+    extras.unshift({ name: "genre", isRequired: true, options });
+  } else if (fight) {
     extras.unshift({ name: "genre", isRequired: true, options: [catalogs.ALL_GENRE, ...options] });
   } else if (options.length) {
     extras.unshift({ name: "genre", isRequired: false, options });
@@ -19386,14 +20448,24 @@ function withFallbackPoster(preview, originBase, item, promoKey, subtitle) {
 }
 async function promoCatalog(def, extra, originBase, client) {
   const promo = promotion(def.promo);
-  let list = await store.promotionCatalog(def.promo, client);
   const genre = String(extra.genre || "").trim();
-  if (genre) list = list.filter((item) => metaBuilder.itemTags(item).includes(genre));
   const search = String(extra.search || "").trim();
+  if (def.promo === "wwe" && genre === documentaries.GENRE) {
+    let docs = await documentaries.list();
+    if (search) docs = docs.filter((doc) => matchesSearch(doc.name, search));
+    return slicePage(docs, extra, PAGE_SIZE).map(documentaries.preview);
+  }
+  let list = await store.promotionCatalog(def.promo, client);
+  if (genre) list = list.filter((item) => metaBuilder.itemTags(item).includes(genre));
   if (search) list = list.filter((item) => matchesSearch(`${item.name} ${promo ? promo.name : ""}`, search));
-  return slicePage(list, extra, PAGE_SIZE).map(
+  const metas = slicePage(list, extra, PAGE_SIZE).map(
     (item) => withFallbackPoster(metaBuilder.preview(item, def.promo), originBase, item, def.promo, metaBuilder.ptDate(item.date))
   );
+  if (def.promo === "wwe" && search && !genre && !Number(extra.skip)) {
+    const docs = (await documentaries.list()).filter((doc) => matchesSearch(doc.name, search));
+    metas.push(...docs.map(documentaries.preview));
+  }
+  return metas;
 }
 async function recentCatalog(def, extra, originBase, client) {
   let list = await store.recent(def.promo, 7, client);
@@ -19470,6 +20542,34 @@ async function topCatalog(def, extra, originBase, client) {
     return { ...preview, name: `${TOP_MEDALS[i] || `#${i + 1}`} ${preview.name}` };
   });
 }
+async function yearCatalog(def, extra, originBase, client) {
+  const year = String(extra.genre || "").trim() || store.eventYears(def.promo)[0];
+  if (!/^\d{4}$/.test(year)) return [];
+  const [shows, events] = await Promise.all([
+    store.showsInYear(def.promo, year, client, { skipImdb: documentaries.imdbSet() }),
+    store.eventsInYear(def.promo, year, client)
+  ]);
+  const search = String(extra.search || "").trim();
+  const list = [
+    ...shows.map((show) => ({ kind: "tvyear", show, name: show.name })),
+    ...events.map((event) => ({ kind: "movie", event, name: event.name }))
+  ].filter((entry) => !search || matchesSearch(entry.name, search));
+  return slicePage(list, extra, PAGE_SIZE).map((entry) => {
+    if (entry.kind === "tvyear") {
+      const preview = metaBuilder.yearShowPreview(entry.show, def.promo, year);
+      if (!preview.poster) preview.poster = fallbackPoster(originBase, entry.show.name, year, def.promo);
+      return preview;
+    }
+    const item = { ...entry.event, kind: "movie", promoKey: def.promo };
+    return withFallbackPoster(
+      metaBuilder.preview(item, def.promo),
+      originBase,
+      item,
+      def.promo,
+      metaBuilder.ptDate(entry.event.date)
+    );
+  });
+}
 async function handleCatalog(type, id, extra, originBase, client) {
   const def = catalogs.byId(id);
   if (!def || def.type !== type && type !== catalogs.FIGHT_TYPE) return { metas: [] };
@@ -19479,6 +20579,7 @@ async function handleCatalog(type, id, extra, originBase, client) {
   if (def.kind === "recent") return { metas: await recentCatalog(def, filters, originBase, client) };
   if (def.kind === "ufc" || def.kind === "ufcfn") return { metas: await ufcCatalog(def, filters, originBase, client) };
   if (def.kind === "top") return { metas: await topCatalog(def, filters, originBase, client) };
+  if (def.kind === "years") return { metas: await yearCatalog(def, filters, originBase, client) };
   return { metas: [] };
 }
 async function buildMeta(metaId, originBase, client) {
@@ -19502,6 +20603,19 @@ async function buildMeta(metaId, originBase, client) {
     if (!meta2.poster) {
       meta2.poster = fallbackPoster(originBase, found2.show.name, metaBuilder.ptDate(episode.airdate), found2.promoKey);
     }
+    return meta2;
+  }
+  if (parsed.kind === "tvyear") {
+    const found2 = await store.findTv(parsed.tvId, client, { allowRemote: false });
+    if (!found2) return null;
+    const episodes = await store.episodesInYear(parsed.tvId, parsed.year, client);
+    const meta2 = metaBuilder.yearShowMeta(found2.show, found2.promoKey, parsed.year, episodes);
+    if (!episodes.length && !client.enabled) {
+      meta2.description = `Para ver os epis\xF3dios, reinstala o addon com a tua chave do TMDB em ${originBase}/configure
+
+${meta2.description}`;
+    }
+    if (!meta2.poster) meta2.poster = fallbackPoster(originBase, found2.show.name, String(parsed.year), found2.promoKey);
     return meta2;
   }
   if (parsed.kind === "tv") {

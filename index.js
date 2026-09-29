@@ -21,6 +21,7 @@ async function youtubeVideos(ctx) {
   return Promise.race([pending, timeout]);
 }
 const catalogs = require('./lib/catalogs');
+const documentaries = require('./lib/documentaries');
 const { promotion } = require('./lib/promotions');
 
 const DEFAULT_PORT = Number(process.env.PORT) || 7100;
@@ -260,6 +261,8 @@ function fallbackPoster(originBase, title, subtitle, tone) {
 function genreOptions(def) {
   if (def.kind === 'promo') {
     return [
+      // Documentarios (lutadores e historia da empresa): a "subpasta" da WWE.
+      ...(def.promo === 'wwe' ? [documentaries.GENRE] : []),
       metaBuilder.SHOW_TAGS.ppv,
       metaBuilder.SHOW_TAGS.weekly,
       metaBuilder.SHOW_TAGS.collection,
@@ -268,6 +271,7 @@ function genreOptions(def) {
       metaBuilder.SHOW_TAGS.archive,
     ];
   }
+  if (def.kind === 'years') return store.eventYears(def.promo);
   if (def.kind === 'ufc') return [metaBuilder.UFC_TAGS.upcoming];
   if (def.kind === 'ufcfn') {
     return [
@@ -283,7 +287,12 @@ function genreOptions(def) {
 function catalogExtras(def, fight) {
   const extras = [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }];
   const options = genreOptions(def);
-  if (fight) {
+  if (def.kind === 'years') {
+    // Cada ano e uma pasta; sem "Todos" (seria o catalogo principal outra vez). O
+    // primeiro ano (o corrente) abre por omissao e, sendo obrigatorio, o catalogo fica
+    // fora do ecra principal nos dois modos.
+    extras.unshift({ name: 'genre', isRequired: true, options });
+  } else if (fight) {
     // Genero obrigatorio: o Stremio nao mostra estes catalogos no ecra principal,
     // so no separador Fight do Explorar, com "Todos" escolhido por omissao.
     extras.unshift({ name: 'genre', isRequired: true, options: [catalogs.ALL_GENRE, ...options] });
@@ -357,16 +366,29 @@ function withFallbackPoster(preview, originBase, item, promoKey, subtitle) {
 // Programas com temporadas + coleccoes por ano + eventos individuais, juntos.
 async function promoCatalog(def, extra, originBase, client) {
   const promo = promotion(def.promo);
-  let list = await store.promotionCatalog(def.promo, client);
-
   const genre = String(extra.genre || '').trim();
-  if (genre) list = list.filter((item) => metaBuilder.itemTags(item).includes(genre));
   const search = String(extra.search || '').trim();
+
+  // Genero "Documentarios" da WWE: lista propria, com ids IMDb (fichas do Cinemeta).
+  if (def.promo === 'wwe' && genre === documentaries.GENRE) {
+    let docs = await documentaries.list();
+    if (search) docs = docs.filter((doc) => matchesSearch(doc.name, search));
+    return slicePage(docs, extra, PAGE_SIZE).map(documentaries.preview);
+  }
+
+  let list = await store.promotionCatalog(def.promo, client);
+  if (genre) list = list.filter((item) => metaBuilder.itemTags(item).includes(genre));
   if (search) list = list.filter((item) => matchesSearch(`${item.name} ${promo ? promo.name : ''}`, search));
 
-  return slicePage(list, extra, PAGE_SIZE).map((item) =>
+  const metas = slicePage(list, extra, PAGE_SIZE).map((item) =>
     withFallbackPoster(metaBuilder.preview(item, def.promo), originBase, item, def.promo, metaBuilder.ptDate(item.date))
   );
+  // Na pesquisa, os documentarios tambem aparecem (no fim, so na primeira pagina).
+  if (def.promo === 'wwe' && search && !genre && !Number(extra.skip)) {
+    const docs = (await documentaries.list()).filter((doc) => matchesSearch(doc.name, search));
+    metas.push(...docs.map(documentaries.preview));
+  }
+  return metas;
 }
 
 // Ultimos 7 dias: episodios emitidos e eventos lancados na semana.
@@ -465,6 +487,40 @@ async function topCatalog(def, extra, originBase, client) {
   });
 }
 
+// Um ano (a "pasta" escolhida no genero): primeiro os programas semanais emitidos nesse
+// ano (Raw, SmackDown, NXT...), cada um so com os episodios desse ano, e depois os
+// eventos. Sem documentarios (tem pasta propria no catalogo principal).
+async function yearCatalog(def, extra, originBase, client) {
+  const year = String(extra.genre || '').trim() || store.eventYears(def.promo)[0];
+  if (!/^\d{4}$/.test(year)) return [];
+  const [shows, events] = await Promise.all([
+    store.showsInYear(def.promo, year, client, { skipImdb: documentaries.imdbSet() }),
+    store.eventsInYear(def.promo, year, client),
+  ]);
+
+  const search = String(extra.search || '').trim();
+  const list = [
+    ...shows.map((show) => ({ kind: 'tvyear', show, name: show.name })),
+    ...events.map((event) => ({ kind: 'movie', event, name: event.name })),
+  ].filter((entry) => !search || matchesSearch(entry.name, search));
+
+  return slicePage(list, extra, PAGE_SIZE).map((entry) => {
+    if (entry.kind === 'tvyear') {
+      const preview = metaBuilder.yearShowPreview(entry.show, def.promo, year);
+      if (!preview.poster) preview.poster = fallbackPoster(originBase, entry.show.name, year, def.promo);
+      return preview;
+    }
+    const item = { ...entry.event, kind: 'movie', promoKey: def.promo };
+    return withFallbackPoster(
+      metaBuilder.preview(item, def.promo),
+      originBase,
+      item,
+      def.promo,
+      metaBuilder.ptDate(entry.event.date)
+    );
+  });
+}
+
 async function handleCatalog(type, id, extra, originBase, client) {
   const def = catalogs.byId(id);
   // Aceita o tipo nativo e o separador Fight, para os dois modos de instalacao.
@@ -475,6 +531,7 @@ async function handleCatalog(type, id, extra, originBase, client) {
   if (def.kind === 'recent') return { metas: await recentCatalog(def, filters, originBase, client) };
   if (def.kind === 'ufc' || def.kind === 'ufcfn') return { metas: await ufcCatalog(def, filters, originBase, client) };
   if (def.kind === 'top') return { metas: await topCatalog(def, filters, originBase, client) };
+  if (def.kind === 'years') return { metas: await yearCatalog(def, filters, originBase, client) };
   return { metas: [] };
 }
 
@@ -503,6 +560,18 @@ async function buildMeta(metaId, originBase, client) {
     if (!meta.poster) {
       meta.poster = fallbackPoster(originBase, found.show.name, metaBuilder.ptDate(episode.airdate), found.promoKey);
     }
+    return meta;
+  }
+
+  if (parsed.kind === 'tvyear') {
+    const found = await store.findTv(parsed.tvId, client, { allowRemote: false });
+    if (!found) return null;
+    const episodes = await store.episodesInYear(parsed.tvId, parsed.year, client);
+    const meta = metaBuilder.yearShowMeta(found.show, found.promoKey, parsed.year, episodes);
+    if (!episodes.length && !client.enabled) {
+      meta.description = `Para ver os episódios, reinstala o addon com a tua chave do TMDB em ${originBase}/configure\n\n${meta.description}`;
+    }
+    if (!meta.poster) meta.poster = fallbackPoster(originBase, found.show.name, String(parsed.year), found.promoKey);
     return meta;
   }
 
