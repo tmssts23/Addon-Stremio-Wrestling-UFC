@@ -18935,8 +18935,7 @@ var require_catalogs = __commonJS({
         promo: "wwe",
         name: "WWE \u2014 Eventos por Ano",
         label: "WWE \u2014 Raw, SmackDown, NXT\u2026 e eventos (PPV/PLE), uma pasta por ano (s\xF3 no Explorar)",
-        byDefault: true,
-        fightOnly: true
+        byDefault: true
       },
       {
         token: "wwetop",
@@ -18946,8 +18945,7 @@ var require_catalogs = __commonJS({
         promo: "wwe",
         name: "WWE \u2014 Top 10 Eventos",
         label: "WWE \u2014 os 10 eventos em destaque (s\xF3 no Explorar)",
-        byDefault: true,
-        fightOnly: true
+        byDefault: true
       },
       {
         token: "aew",
@@ -18977,8 +18975,7 @@ var require_catalogs = __commonJS({
         promo: "aew",
         name: "AEW \u2014 Eventos por Ano",
         label: "AEW \u2014 Dynamite, Collision\u2026 e eventos (PPV), uma pasta por ano (s\xF3 no Explorar)",
-        byDefault: true,
-        fightOnly: true
+        byDefault: true
       },
       {
         token: "aewtop",
@@ -18988,8 +18985,7 @@ var require_catalogs = __commonJS({
         promo: "aew",
         name: "AEW \u2014 Top 10 Eventos",
         label: "AEW \u2014 os 10 eventos em destaque (s\xF3 no Explorar)",
-        byDefault: true,
-        fightOnly: true
+        byDefault: true
       },
       {
         token: "tna",
@@ -19019,8 +19015,7 @@ var require_catalogs = __commonJS({
         promo: "tna",
         name: "TNA \u2014 Eventos por Ano",
         label: "TNA \u2014 iMPACT!, Xplosion\u2026 e eventos (PPV), uma pasta por ano (s\xF3 no Explorar)",
-        byDefault: true,
-        fightOnly: true
+        byDefault: true
       },
       {
         token: "tnatop",
@@ -19030,8 +19025,7 @@ var require_catalogs = __commonJS({
         promo: "tna",
         name: "TNA \u2014 Top 10 Eventos",
         label: "TNA \u2014 os 10 eventos em destaque (s\xF3 no Explorar)",
-        byDefault: true,
-        fightOnly: true
+        byDefault: true
       },
       {
         token: "ufc",
@@ -19050,8 +19044,7 @@ var require_catalogs = __commonJS({
         promo: "ufc",
         name: "UFC \u2014 Eventos por Ano",
         label: "UFC \u2014 todos os eventos (numerados e Fight Night) numa pasta por ano (s\xF3 no Explorar)",
-        byDefault: true,
-        fightOnly: true
+        byDefault: true
       },
       {
         token: "ufcfn",
@@ -19070,8 +19063,7 @@ var require_catalogs = __commonJS({
         promo: "ufc",
         name: "UFC \u2014 Top 10 Eventos",
         label: "UFC \u2014 os 10 eventos numerados em destaque (s\xF3 no Explorar)",
-        byDefault: true,
-        fightOnly: true
+        byDefault: true
       },
       {
         token: "ufcshows",
@@ -19204,20 +19196,16 @@ var require_catalogs = __commonJS({
     }
     function entries(config) {
       const chosen = selected(config);
-      const classic = isClassic(config);
-      const out = chosen.filter((def) => classic || !def.fightOnly).map((def) => ({ def, id: def.id, type: def.type, name: def.name, fight: false }));
-      if (!classic) {
-        for (const def of chosen) {
-          out.push({
-            def,
-            id: `${FIGHT_PREFIX}${def.id}`,
-            type: FIGHT_TYPE,
-            name: SHORT_NAMES[def.token] || def.name,
-            fight: true
-          });
-        }
+      if (isClassic(config)) {
+        return chosen.map((def) => ({ def, id: def.id, type: def.type, name: def.name, fight: false }));
       }
-      return out;
+      return chosen.map((def) => ({
+        def,
+        id: `${FIGHT_PREFIX}${def.id}`,
+        type: FIGHT_TYPE,
+        name: SHORT_NAMES[def.token] || def.name,
+        fight: true
+      }));
     }
     module2.exports = {
       CATALOGS,
